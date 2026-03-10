@@ -298,7 +298,11 @@ def rank_stabsel(Xs, y, rng):
     pi_hat = sel_count / float(SS_B)
     mean_c = coef_sum  / float(SS_B)
 
-    rank = np.lexsort((-mean_c, -pi_hat))
+    # Explicit two-pass descending sort: primary = pi_hat, tiebreak = mean_c
+    # (replaces np.lexsort((-mean_c, -pi_hat)) which sorts last key first,
+    #  making the primary/secondary roles easy to misread)
+    order = np.argsort(-pi_hat, kind='stable')
+    rank  = order[np.argsort(-mean_c[order], kind='stable')]
     return rank.copy()
 
 
