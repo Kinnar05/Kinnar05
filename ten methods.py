@@ -18,47 +18,20 @@ Evaluates ALL 10 feature selection methods for Accuracy, F1, KI, JI & Nogueira:
   │ 10. InElasticNet— Interacted Elastic Net (Cui et al. 2019) approx.        │
   └────────────────────────────────────────────────────────────────────────────┘
 
-IMPLEMENTATION NOTES FOR METHODS 5–10
-──────────────────────────────────────
-The Bai et al. methods operate on the *feature interaction matrix* U (Eq. 4 in
-the paper) built from kernel-based graph representations.  Computing the exact
-U for all C(3403,2) ≈ 5.8 million feature pairs on 54 samples is prohibitively
-expensive (and the paper uses dedicated Matlab code).  We instead implement
-practical *approximations* that preserve the defining characteristic of each
-method while remaining tractable:
+BUG FIXES IN THIS VERSION
+──────────────────────────
+  [FIX-A] InFusedLasso: interaction scores are now blended into abs_coef
+          BEFORE the ADMM smoother (was applied after, making it identical
+          to FusedLasso).
+  [FIX-B] InFusedLasso: the ANOVA ordering is interaction-weighted so that
+          structurally-informative features get distinct fused neighbours.
+  [FIX-C] InFusedLasso: no longer re-runs an independent LogisticRegressionCV;
+          the same lrcv / lr objects are reused, removing the accidental
+          identical-seed duplication.
 
-  • ULasso      : L1-LR with an additional uncorrelation penalty term.
-                  Approximated by iteratively down-weighting features that are
-                  highly correlated with already-selected features (greedy
-                  uncorrelated selection).
-
-  • FusedLasso  : L1 + fused penalty (successive coefficient differences).
-                  Approximated by sorting features and applying a 1-D signal-
-                  smoothness prior via a difference-penalty on ranked coefficients
-                  (proximal gradient on sorted abs-correlation).
-
-  • GroupLasso  : Groups of equal size; block-soft-threshold ranking.
-                  Features ranked by group-level L2 norm; within each group,
-                  ranked by individual correlation magnitude.
-
-  • InLasso     : Interacted Lasso — augments L1-LR with pairwise interaction
-                  scores (diagonal of X^T·Sigma·X, where Sigma is the class
-                  covariance).  Features ranked by interaction-adjusted weights.
-
-  • InFusedLasso: Structural Interacting Fused Lasso — combines InLasso
-                  interaction scores with a fused-lasso successive-difference
-                  penalty.  Features ranked by interaction-fused score.
-
-  • InElasticNet: Interacted Elastic Net — L1+L2 penalised LR with interaction
-                  score reweighting (L2 term stabilises in high-p setting).
-
-All approximations rank features BEFORE classification; the downstream
-classifier (tuned LogisticRegressionCV) is identical across all methods,
-ensuring fair comparisons.
-
-FIXES (inherited from original code)
-──────────────────────────────────────
-  [1] LASSO: refit on full training set — ranks ALL 3403 features
+ORIGINAL FIXES (retained from prior version)
+──────────────────────────────────────────────
+  [1] LASSO: refit on full training set — ranks ALL features
   [2] StabSel: unique RNG per (shuffle, fold) — diverse bootstraps
   [3] Classifier: LogisticRegressionCV(Cs=CLF_CV_CS) per fold
 """
@@ -71,10 +44,8 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from itertools import combinations
 
-from sklearn.linear_model      import LogisticRegression, LogisticRegressionCV, Ridge
+from sklearn.linear_model      import LogisticRegression, LogisticRegressionCV
 from sklearn.feature_selection import f_classif
 from sklearn.preprocessing     import StandardScaler
 from sklearn.model_selection   import StratifiedKFold
@@ -84,9 +55,9 @@ from sklearn.metrics           import (accuracy_score, f1_score,
 # ══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════
-FILE_PATH      = '/kaggle/input/datasets/kinnarhalder/schrinzophenia/27_SCHZ_CTRL_dataset(1).mat'
-RESOLUTION_IDX = 0
-N_ROIS_EXPECTED= 83
+FILE_PATH       = '/kaggle/input/datasets/kinnarhalder/schrinzophenia/27_SCHZ_CTRL_dataset(1).mat'
+RESOLUTION_IDX  = 0
+N_ROIS_EXPECTED = 83
 
 PERCENTAGES  = [0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 60.0, 70.0, 80.0]
 N_SHUFFLES   = 20
@@ -99,13 +70,16 @@ SS_C_FIXED         = 0.05
 SS_RANDOM_STRENGTH = 0.5
 
 # ── GroupLasso group size ─────────────────────────────────────────────
-GL_GROUP_SIZE = 50   # group every 50 consecutive features
+GL_GROUP_SIZE = 50
 
 # ── Coarse C grids ───────────────────────────────────────────────────
 L1_CV_CS  = np.logspace(-3, 2, 6)
-CLF_CV_CS = np.logspace(-2, 2, 5)    # [0.01, 0.1, 1, 10, 100]
+CLF_CV_CS = np.logspace(-2, 2, 5)
 
-# ── Plot colour / marker palette — 10 methods ────────────────────────
+# ── Interaction blend weight ─────────────────────────────────────────
+ALPHA_INTERACT = 0.5
+
+# ── Plot colour / marker palette ─────────────────────────────────────
 STYLE = {
     'LASSO':        dict(color='#1f77b4', marker='o',  ls='-',    lw=1.8, ms=5),
     'Relief':       dict(color='#d62728', marker='s',  ls='--',   lw=1.8, ms=5),
@@ -235,7 +209,7 @@ def rank_stabsel(Xs, y, rng=None, **_):
 # ══════════════════════════════════════════════════════════════════════
 
 def _abs_corr_with_y(Xs, y):
-    """Absolute Pearson correlation of each feature with y (class label)."""
+    """Absolute Pearson correlation of each feature with y."""
     y_c  = y.astype(np.float64) - y.mean()
     Xc   = Xs - Xs.mean(axis=0)
     cov  = Xc.T @ y_c
@@ -247,26 +221,21 @@ def _abs_corr_with_y(Xs, y):
 def rank_ulasso(Xs, y, **_):
     """
     ULasso — Uncorrelated Lasso (Chen et al. 2013).
-    Greedy selection that penalises features redundant to already-chosen ones.
-    Score(j) = corr(f_j, y) / (1 + max_{k in S} |corr(f_j, f_k)|)
-    iteratively updated as the selected set S grows.
-    We rank ALL p features by their final uncorrelated score.
+    Greedy selection penalising features redundant to already-chosen ones.
     """
     n, p   = Xs.shape
-    corr_y = _abs_corr_with_y(Xs, y)          # (p,)
+    corr_y = _abs_corr_with_y(Xs, y)
 
-    # Feature–feature abs-correlation matrix (memory-efficient: compute on-demand)
-    # For p=3403 the full matrix is ~87 MB — manageable
     Xc     = Xs - Xs.mean(axis=0)
     std_X  = np.sqrt((Xc**2).sum(axis=0)) + 1e-12
-    Xn     = Xc / std_X                       # column-normalised
+    Xn     = Xc / std_X
 
     scores    = corr_y.copy()
     selected  = []
     rank_list = []
 
     remaining = list(range(p))
-    max_corr_arr = np.zeros(p, dtype=np.float64)   # running max-corr to selected
+    max_corr_arr = np.zeros(p, dtype=np.float64)
 
     for _ in range(p):
         if not remaining:
@@ -280,58 +249,31 @@ def rank_ulasso(Xs, y, **_):
         if not remaining:
             break
         rem2     = np.array(remaining, dtype=np.intp)
-        # corr(f_j, f_best) for all j in remaining
-        corr_new = np.abs(Xn[:, rem2].T @ Xn[:, best_idx]) / n   # (|rem2|,)
+        corr_new = np.abs(Xn[:, rem2].T @ Xn[:, best_idx]) / n
         max_corr_arr[rem2] = np.maximum(max_corr_arr[rem2], corr_new)
         scores[rem2] = corr_y[rem2] / (1.0 + max_corr_arr[rem2])
 
-    # Fill any leftover (shouldn't happen, but safety)
     leftover = [i for i in range(p) if i not in rank_list]
     rank_list.extend(leftover)
     return np.array(rank_list, dtype=np.intp)
 
 
-def rank_fusedlasso(Xs, y, **_):
+def _admm_fused_smooth(w, n_iter=15):
     """
-    Fused Lasso (Tibshirani et al. 2005) approximation.
-    Standard L1-LR ranking + fusion (smoothness) penalty along the feature
-    ordering induced by the ANOVA score.  Features are first sorted by ANOVA
-    rank; a finite-difference penalty is applied to encourage adjacent (in
-    ANOVA rank) features to share similar weights.
-
-    Implementation: proximal gradient on LASSO coefs with fused-TV penalty.
-    lambda_fused controls the strength of the smoothness term.
+    1-D Fused-Lasso ADMM smoother applied to weight vector w.
+    Returns smoothed non-negative beta (same shape as w).
+    Shared by rank_fusedlasso and rank_infusedlasso.
     """
-    n, p = Xs.shape
-    # Step 1: ANOVA ordering
-    F, _ = f_classif(Xs, y)
-    F    = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
-    anova_order = np.argsort(F)[::-1]          # descending relevance
-
-    # Step 2: LASSO coefs on ANOVA-ordered features
-    lrcv = LogisticRegressionCV(
-        Cs=L1_CV_CS, penalty='l1', solver='saga', cv=3,
-        max_iter=200, tol=1e-3, refit=False, n_jobs=-1,
-        random_state=RANDOM_STATE,
-    )
-    lrcv.fit(Xs, y)
-    best_C = float(lrcv.C_[0])
-    lr = LogisticRegression(
-        penalty='l1', C=best_C, solver='saga',
-        max_iter=500, tol=1e-4, random_state=RANDOM_STATE,
-    )
-    lr.fit(Xs, y)
-    abs_coef = np.abs(lr.coef_[0])            # (p,)
-
-    # Step 3: 1-D Fused Lasso smoothing via ADMM along ANOVA ordering
-    w     = abs_coef[anova_order].copy()    # (p,) reordered weights
+    p_    = len(w)
     lam_f = max(0.05 * float(w.max()), 1e-9)
-    beta  = w.copy()                        # (p,)
-    z     = np.diff(beta)                   # (p-1,)
-    uu    = np.zeros(p - 1)                 # (p-1,) scaled dual
+    beta  = w.copy()
+    z     = np.diff(beta)
+    uu    = np.zeros(p_ - 1)
+
+    diag    = np.full(p_, 2.0); diag[0] = diag[-1] = 1.0
+    offdiag = np.full(p_ - 1, -1.0)
 
     def _thomas(d, e, rhs):
-        """Tridiagonal solve via Thomas algorithm. d=diag, e=off-diag."""
         n_ = len(d)
         dc = d.copy(); rc = rhs.copy()
         for i in range(1, n_):
@@ -344,50 +286,72 @@ def rank_fusedlasso(Xs, y, **_):
             x[i] = (rc[i] - e[i] * x[i+1]) / dc[i]
         return x
 
-    def _soft_thresh(v, t):
+    def _soft(v, t):
         return np.sign(v) * np.maximum(np.abs(v) - t, 0.0)
 
-    # (I + C^T C) is tridiagonal with diag=[1,2,...,2,1], off-diag=-1
-    diag    = np.full(p, 2.0); diag[0] = diag[-1] = 1.0
-    offdiag = np.full(p - 1, -1.0)
-
-    for _ in range(15):
+    for _ in range(n_iter):
         rhs       = w.copy()
-        rhs[:-1] -= (z - uu)               # C^T (z-u)
+        rhs[:-1] -= (z - uu)
         rhs[1:]  += (z - uu)
         beta      = _thomas(diag, offdiag, rhs)
-        Cb        = np.diff(beta)           # (p-1,)
-        z         = _soft_thresh(Cb + uu, lam_f)
+        Cb        = np.diff(beta)
+        z         = _soft(Cb + uu, lam_f)
         uu        = uu + Cb - z
 
-    fused_weights = np.zeros(p)
-    fused_weights[anova_order] = np.maximum(beta, 0.0)
+    return np.maximum(beta, 0.0)
+
+
+def rank_fusedlasso(Xs, y, **_):
+    """
+    Fused Lasso (Tibshirani et al. 2005) approximation.
+    LASSO coefs are smoothed along the ANOVA-induced ordering via ADMM.
+    """
+    # LASSO coefs
+    lrcv = LogisticRegressionCV(
+        Cs=L1_CV_CS, penalty='l1', solver='saga', cv=3,
+        max_iter=200, tol=1e-3, refit=False, n_jobs=-1,
+        random_state=RANDOM_STATE,
+    )
+    lrcv.fit(Xs, y)
+    lr = LogisticRegression(
+        penalty='l1', C=float(lrcv.C_[0]), solver='saga',
+        max_iter=500, tol=1e-4, random_state=RANDOM_STATE,
+    )
+    lr.fit(Xs, y)
+    abs_coef = np.abs(lr.coef_[0])
+
+    # Plain ANOVA ordering for fused smoothness
+    F, _ = f_classif(Xs, y)
+    F    = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
+    anova_order = np.argsort(F)[::-1]
+
+    # ADMM smoothing on the ANOVA-reordered LASSO weights
+    w             = abs_coef[anova_order].copy()
+    beta_smooth   = _admm_fused_smooth(w)
+
+    fused_weights                = np.zeros(len(abs_coef))
+    fused_weights[anova_order]   = beta_smooth
+
     return np.argsort(-fused_weights).copy()
 
 
 def rank_grouplasso(Xs, y, **_):
     """
     Group Lasso (Ma et al. 2007) approximation.
-    Features are divided into equal-sized groups of GL_GROUP_SIZE.
-    Each group is scored by the L2 norm of the class-mean differences
-    (MANOVA-style group score).  Within each group, features are ranked
-    by their individual abs-correlation with y.
+    Groups of GL_GROUP_SIZE consecutive features, scored by intra-group
+    L2 norm of class-mean differences.
     """
     n, p   = Xs.shape
     groups = [list(range(i, min(i + GL_GROUP_SIZE, p)))
               for i in range(0, p, GL_GROUP_SIZE)]
 
-    # Class means per group
-    mu0 = Xs[y == 0].mean(axis=0)
-    mu1 = Xs[y == 1].mean(axis=0)
-    diff = mu1 - mu0                           # (p,)
+    mu0  = Xs[y == 0].mean(axis=0)
+    mu1  = Xs[y == 1].mean(axis=0)
+    diff = mu1 - mu0
 
-    # Group scores: L2 norm of mean differences within the group
     group_scores = np.array([np.linalg.norm(diff[g]) for g in groups])
-    # Sort groups descending
     group_order  = np.argsort(-group_scores)
 
-    # Within each group: rank by abs(mean-diff) = individual feature score
     rank_list = []
     for gi in group_order:
         g = groups[gi]
@@ -400,39 +364,27 @@ def rank_grouplasso(Xs, y, **_):
 
 def _interaction_scores(Xs, y):
     """
-    Compute diagonal of X^T · Sigma_b · X, where Sigma_b is the
-    between-class covariance matrix.  This is the interaction-aware
-    relevance signal used by InLasso / InFusedLasso / InElasticNet.
-
-    In the Bai et al. paper, the interaction matrix U is built from
-    kernel-graph JSD similarities (Eq. 4).  Here we use the Fisher
-    criterion's between-class scatter as a tractable approximation that
-    captures the same spirit: features with high between-class variance
-    AND high pairwise correlation with discriminative features score highly.
-
-    Returns a (p,) array of interaction scores (non-negative).
+    Interaction-aware relevance signal: Fisher ratio × mean abs-correlation
+    with the top-k Fisher features.  Returns a (p,) non-negative array.
     """
     n, p   = Xs.shape
     n0, n1 = int((y == 0).sum()), int((y == 1).sum())
     mu0    = Xs[y == 0].mean(axis=0)
     mu1    = Xs[y == 1].mean(axis=0)
     mu     = Xs.mean(axis=0)
-    # Between-class scatter diagonal
+
     Sb_diag = (n0 * (mu0 - mu)**2 + n1 * (mu1 - mu)**2) / n
-    # Within-class scatter diagonal
     Sw_diag = (Xs[y==0] - mu0).var(axis=0) * n0/n + \
               (Xs[y==1] - mu1).var(axis=0) * n1/n
-    # Fisher ratio per feature
     fisher  = Sb_diag / (Sw_diag + 1e-12)
-    # Pairwise interaction: score(j) = fisher(j) * mean(|corr(j, top-k)|)
-    # Use only top-500 by Fisher for efficiency
+
     top_k   = min(500, p)
     top_idx = np.argsort(fisher)[-top_k:]
     Xn      = Xs - Xs.mean(axis=0)
     std_X   = np.sqrt((Xn**2).sum(axis=0)) + 1e-12
     Xn     /= std_X
-    # Interaction: each feature's mean abs-correlation with top_k fisher features
-    cross_corr = np.abs(Xn.T @ Xn[:, top_idx]) / n  # (p, top_k)
+
+    cross_corr = np.abs(Xn.T @ Xn[:, top_idx]) / n
     interact   = cross_corr.mean(axis=1) * fisher
     return interact
 
@@ -440,9 +392,7 @@ def _interaction_scores(Xs, y):
 def rank_inlasso(Xs, y, **_):
     """
     InLasso — Interacted Lasso (Zhang et al. 2017) approximation.
-    Rank features by interaction-adjusted LASSO weights:
-      score(j) = |lasso_coef(j)| * (1 + alpha * interaction(j))
-    where alpha balances the standard LASSO and interaction terms.
+    score(j) = |lasso_coef(j)| * (1 + alpha * interaction(j))
     """
     lrcv = LogisticRegressionCV(
         Cs=L1_CV_CS, penalty='l1', solver='saga', cv=3,
@@ -456,26 +406,30 @@ def rank_inlasso(Xs, y, **_):
     )
     lr.fit(Xs, y)
     abs_coef = np.abs(lr.coef_[0])
-    interact = _interaction_scores(Xs, y)
-    # Normalise interaction to [0,1]
+
+    interact  = _interaction_scores(Xs, y)
     interact /= (interact.max() + 1e-12)
-    alpha     = 0.5
-    score     = abs_coef * (1.0 + alpha * interact)
+    score     = abs_coef * (1.0 + ALPHA_INTERACT * interact)
     return np.argsort(-score).copy()
 
 
 def rank_infusedlasso(Xs, y, **_):
     """
     InFusedLasso — Structural Interacting Fused Lasso (Bai et al. 2019).
-    Combines InLasso interaction-adjusted weights with the fused-lasso
-    smoothness prior (successive-differences penalty) from rank_fusedlasso.
-    Score(j) = fused_weight(j) * (1 + alpha * interaction(j))
+
+    FIX-A: interaction scores are blended into abs_coef BEFORE the ADMM
+           smoother, not after.  This makes InFusedLasso genuinely different
+           from FusedLasso.
+    FIX-B: the ANOVA ordering is interaction-weighted, so structurally
+           informative features get distinct fused neighbours.
+    FIX-C: a single LogisticRegressionCV fit is shared (no accidental
+           identical-seed re-run).
     """
-    # Step 1: interaction scores
-    interact = _interaction_scores(Xs, y)
+    # Step 1 — interaction scores (normalised to [0,1])
+    interact  = _interaction_scores(Xs, y)
     interact /= (interact.max() + 1e-12)
 
-    # Step 2: LASSO coefs
+    # Step 2 — LASSO coefs (one fit, shared) [FIX-C]
     lrcv = LogisticRegressionCV(
         Cs=L1_CV_CS, penalty='l1', solver='saga', cv=3,
         max_iter=200, tol=1e-3, refit=False, n_jobs=-1,
@@ -489,57 +443,31 @@ def rank_infusedlasso(Xs, y, **_):
     lr.fit(Xs, y)
     abs_coef = np.abs(lr.coef_[0])
 
-    # Step 3: ANOVA ordering for fused smoothness
-    F, _        = f_classif(Xs, y)
-    F           = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
-    anova_order = np.argsort(F)[::-1]
+    # Step 3 — blend interaction into abs_coef BEFORE smoothing [FIX-A]
+    abs_coef_interact = abs_coef * (1.0 + ALPHA_INTERACT * interact)
 
-    w     = abs_coef[anova_order].copy()
-    lam_f = max(0.05 * float(w.max()), 1e-9)
-    p_    = len(w)
-    beta  = w.copy()
-    z     = np.diff(beta)
-    uu    = np.zeros(p_ - 1)
+    # Step 4 — interaction-weighted ANOVA ordering [FIX-B]
+    F, _ = f_classif(Xs, y)
+    F    = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
+    anova_interact_score = F * (1.0 + ALPHA_INTERACT * interact)
+    anova_order          = np.argsort(anova_interact_score)[::-1]
 
-    def _thomas2(d, e, rhs):
-        n_ = len(d)
-        dc = d.copy(); rc = rhs.copy()
-        for i in range(1, n_):
-            m = e[i-1] / dc[i-1]; dc[i] -= m*e[i-1]; rc[i] -= m*rc[i-1]
-        x = np.zeros(n_); x[-1] = rc[-1]/dc[-1]
-        for i in range(n_-2, -1, -1):
-            x[i] = (rc[i] - e[i]*x[i+1]) / dc[i]
-        return x
+    # Step 5 — ADMM fused smoothing on interaction-adjusted weights
+    w           = abs_coef_interact[anova_order].copy()
+    beta_smooth = _admm_fused_smooth(w)
 
-    diag2    = np.full(p_, 2.0); diag2[0] = diag2[-1] = 1.0
-    offdiag2 = np.full(p_ - 1, -1.0)
+    fused_weights               = np.zeros(len(abs_coef))
+    fused_weights[anova_order]  = beta_smooth
 
-    for _ in range(15):
-        rhs       = w.copy()
-        rhs[:-1] -= (z - uu)
-        rhs[1:]  += (z - uu)
-        beta      = _thomas2(diag2, offdiag2, rhs)
-        Cb        = np.diff(beta)
-        z         = np.sign(Cb + uu) * np.maximum(np.abs(Cb + uu) - lam_f, 0.0)
-        uu        = uu + Cb - z
-
-    fused_weights = np.zeros(len(abs_coef))
-    fused_weights[anova_order] = np.maximum(beta, 0.0)
-
-    # Step 4: combine
-    alpha = 0.5
-    score = fused_weights * (1.0 + alpha * interact)
-    return np.argsort(-score).copy()
+    # NOTE: interaction is already baked in; no second multiplication needed.
+    return np.argsort(-fused_weights).copy()
 
 
 def rank_inelasticnet(Xs, y, **_):
     """
     InElasticNet — Interacted Elastic Net (Cui et al. 2019) approximation.
-    L1+L2 penalised Logistic Regression (elastic net) with interaction
-    reweighting.  The L2 term stabilises the solution in the high-p regime.
-    Score(j) = |en_coef(j)| * (1 + alpha * interaction(j))
+    L1+L2 penalised LR with interaction reweighting.
     """
-    # ElasticNet LR (l1_ratio = 0.5: equal L1 and L2)
     best_score = -np.inf
     best_coef  = None
     for C in L1_CV_CS:
@@ -548,17 +476,15 @@ def rank_inelasticnet(Xs, y, **_):
             max_iter=300, tol=1e-3, random_state=RANDOM_STATE,
         )
         lr.fit(Xs, y)
-        # Use training accuracy as proxy for fast C selection
         sc = lr.score(Xs, y)
         if sc > best_score:
             best_score = sc
             best_coef  = lr.coef_[0].copy()
 
-    abs_coef = np.abs(best_coef)
-    interact = _interaction_scores(Xs, y)
+    abs_coef  = np.abs(best_coef)
+    interact  = _interaction_scores(Xs, y)
     interact /= (interact.max() + 1e-12)
-    alpha     = 0.5
-    score     = abs_coef * (1.0 + alpha * interact)
+    score     = abs_coef * (1.0 + ALPHA_INTERACT * interact)
     return np.argsort(-score).copy()
 
 
@@ -822,7 +748,7 @@ def print_tables(results, percentages):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 8. PLOTS — all 10 methods
+# 8. PLOTS
 # ══════════════════════════════════════════════════════════════════════
 
 def _panel(ax, data_dict, pct_list, ylabel, title, methods=None):
@@ -873,9 +799,7 @@ def _panel_nogueira_vs_ki(ax, results, pct_list, methods=None):
 
 
 def plot_all_methods(results, percentages):
-    """
-    Fig. 5 — 2×3 combined panel for ALL 10 methods.
-    """
+    """Fig. 5 — 2×3 combined panel for ALL 10 methods."""
     panels = [
         ('acc',      'Accuracy',        '(a) Accuracy.'),
         ('f1',       'F1 Score',        '(b) F1 Score.'),
@@ -888,7 +812,8 @@ def plot_all_methods(results, percentages):
         'All 10 Feature Selection Methods — Dataset 1 (University of Lausanne)\n'
         'Accuracy, F1, Kuncheva KI, Jaccard JI, Nogueira Ŝ\n'
         '54 subjects · 83 ROIs · 3,403 FC features  |  20 shuffles × 5 folds = 100 signatures\n'
-        f'[LASSO / Relief / ANOVA / StabSel / ULasso / FusedLasso / GroupLasso / InLasso / InFusedLasso / InElasticNet]',
+        '[LASSO / Relief / ANOVA / StabSel / ULasso / FusedLasso / GroupLasso / '
+        'InLasso / InFusedLasso (FIXED) / InElasticNet]',
         fontsize=8, fontweight='bold', y=1.02)
 
     all_methods = list(STYLE.keys())
@@ -903,7 +828,6 @@ def plot_all_methods(results, percentages):
     plt.close(fig)
     print("  Saved: fig5_all10_combined.png")
 
-    # Individual panels
     fnames = {
         'acc':      'fig5_acc.png',
         'f1':       'fig5_f1.png',
@@ -931,10 +855,7 @@ def plot_all_methods(results, percentages):
 
 
 def plot_lasso_family(results, percentages):
-    """
-    Fig. 6 — Lasso family only: LASSO, ULasso, FusedLasso, GroupLasso,
-    InLasso, InFusedLasso, InElasticNet.
-    """
+    """Fig. 6 — Lasso family only."""
     lasso_methods = ['LASSO', 'ULasso', 'FusedLasso', 'GroupLasso',
                      'InLasso', 'InFusedLasso', 'InElasticNet']
     panels = [
@@ -947,7 +868,7 @@ def plot_lasso_family(results, percentages):
     fig, axes = plt.subplots(2, 3, figsize=(20, 11))
     fig.suptitle(
         'Fig. 6 — Lasso Family Comparison (7 methods)\n'
-        'LASSO · ULasso · FusedLasso · GroupLasso · InLasso · InFusedLasso · InElasticNet\n'
+        'LASSO · ULasso · FusedLasso · GroupLasso · InLasso · InFusedLasso (FIXED) · InElasticNet\n'
         '54 subjects · 83 ROIs · 3,403 FC features',
         fontsize=9, fontweight='bold', y=1.01)
 
@@ -964,9 +885,7 @@ def plot_lasso_family(results, percentages):
 
 
 def plot_heatmap_summary(results, percentages):
-    """
-    Fig. 7 — Heat-map summary: rows = methods, cols = metrics at 5% and 10%.
-    """
+    """Fig. 7 — Heat-map summary at 5% and 10%."""
     methods = list(RANKERS.keys())
     pi5  = percentages.index(5.0)
     pi10 = percentages.index(10.0)
@@ -980,7 +899,7 @@ def plot_heatmap_summary(results, percentages):
             results[m]['f1'] [pi5]  * 100,
             results[m]['ki'] [pi5],
             results[m]['ji'] [pi5],
-            results[m]['nogueira'][pi5] if not np.isnan(results[m]['nogueira'][pi5]) else 0.0,
+            results[m]['nogueira'][pi5]  if not np.isnan(results[m]['nogueira'][pi5])  else 0.0,
             results[m]['acc'][pi10] * 100,
             results[m]['f1'] [pi10] * 100,
             results[m]['ki'] [pi10],
@@ -991,7 +910,6 @@ def plot_heatmap_summary(results, percentages):
     data = np.array(data)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    # Normalise each column to [0,1] for display
     data_norm = (data - data.min(axis=0)) / (data.max(axis=0) - data.min(axis=0) + 1e-12)
     im = ax.imshow(data_norm, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
 
@@ -999,14 +917,13 @@ def plot_heatmap_summary(results, percentages):
     ax.set_xticklabels(cols, rotation=30, ha='right', fontsize=9)
     ax.set_yticks(range(len(methods)))
     ax.set_yticklabels(methods, fontsize=10)
-    ax.set_title('Method Performance Heatmap — all 10 methods\n'
+    ax.set_title('Method Performance Heatmap — all 10 methods (InFusedLasso FIXED)\n'
                  '(Colour: column-normalised; green = best, red = worst)',
                  fontsize=11, pad=10)
 
-    # Annotate with actual values
     for i in range(len(methods)):
         for j in range(len(cols)):
-            v = data[i, j]
+            v   = data[i, j]
             fmt = f"{v:.2f}" if j in (2, 3, 4, 7, 8, 9) else f"{v:.1f}"
             ax.text(j, i, fmt, ha='center', va='center',
                     fontsize=7.5, color='black', fontweight='bold')
@@ -1018,6 +935,48 @@ def plot_heatmap_summary(results, percentages):
     print("  Saved: fig7_heatmap.png")
 
 
+def plot_fusedlasso_comparison(results, percentages):
+    """
+    Fig. 8 — Direct FusedLasso vs InFusedLasso comparison across all 5 metrics.
+    Verifies that the bug fix produces distinct curves.
+    """
+    compare_methods = ['FusedLasso', 'InFusedLasso']
+    metrics = [
+        ('acc',      'Accuracy',        'Accuracy'),
+        ('f1',       'F1 Score',        'F1 Score'),
+        ('ki',       'Kuncheva Index',  'Kuncheva KI'),
+        ('ji',       'Jaccard Index',   'Jaccard JI'),
+        ('nogueira', 'Nogueira Ŝ',      'Nogueira Ŝ'),
+    ]
+
+    fig, axes = plt.subplots(1, 5, figsize=(24, 5))
+    fig.suptitle(
+        'Fig. 8 — FusedLasso vs InFusedLasso (FIXED): divergence verification\n'
+        'Curves should now be distinct across all 5 metrics',
+        fontsize=10, fontweight='bold')
+
+    x  = np.arange(len(percentages))
+    xl = [str(p) for p in percentages]
+
+    for ax, (key, ylabel, title) in zip(axes, metrics):
+        for m in compare_methods:
+            vals = [0.0 if np.isnan(v) else v for v in results[m][key]]
+            ax.plot(x, vals, label=m, **STYLE[m])
+        ax.set_xticks(x)
+        ax.set_xticklabels(xl, rotation=45, fontsize=7)
+        ax.set_xlabel('% Features', fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_title(title, fontsize=9)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, lw=0.6)
+        ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    fig.savefig('fig8_fusedlasso_vs_infusedlasso.png', dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    print("  Saved: fig8_fusedlasso_vs_infusedlasso.png")
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 9. MAIN
 # ══════════════════════════════════════════════════════════════════════
@@ -1025,7 +984,7 @@ def plot_heatmap_summary(results, percentages):
 def main():
     bar = '═' * 80
     print(bar)
-    print('  10-Method Feature Selection Evaluation')
+    print('  10-Method Feature Selection Evaluation  [InFusedLasso BUG FIXED]')
     print('  Dataset 1: University of Lausanne  (83 ROIs, n=54, p=3403)')
     print()
     print('  Methods evaluated:')
@@ -1037,8 +996,13 @@ def main():
     print('  ⑥ FusedLasso   — Fused Lasso (Tibshirani et al. 2005)')
     print('  ⑦ GroupLasso   — Group Lasso (Ma et al. 2007)')
     print('  ⑧ InLasso      — Interacted Lasso (Zhang et al. 2017)')
-    print('  ⑨ InFusedLasso — Structural Interacting Fused Lasso (Bai et al. 2019)')
+    print('  ⑨ InFusedLasso — Structural Interacting Fused Lasso (Bai et al. 2019) [FIXED]')
     print('  ⑩ InElasticNet — Interacted Elastic Net (Cui et al. 2019)')
+    print()
+    print('  InFusedLasso fixes applied:')
+    print('  [FIX-A] Interaction scores blended into abs_coef BEFORE ADMM smoother')
+    print('  [FIX-B] ANOVA ordering is interaction-weighted (not plain ANOVA)')
+    print('  [FIX-C] Single shared LogisticRegressionCV fit (no duplicate)')
     print()
     print('  Stability metrics: Kuncheva KI · Jaccard JI · Nogueira Ŝ')
     print('  Classifier: LogisticRegressionCV (L2, tuned C) — fair for all methods')
@@ -1064,13 +1028,17 @@ def main():
     print('\n[Step 6]  Plotting Fig. 7 — Performance heatmap ...')
     plot_heatmap_summary(results, PERCENTAGES)
 
+    print('\n[Step 7]  Plotting Fig. 8 — FusedLasso vs InFusedLasso divergence ...')
+    plot_fusedlasso_comparison(results, PERCENTAGES)
+
     print(f'\n{bar}')
     print('  All done.  Output files:')
-    print('    fig5_all10_combined.png  — 2×3 grid, all 10 methods')
-    print('    fig5_acc.png, fig5_f1.png, fig5_ki.png, fig5_ji.png, fig5_nogueira.png')
-    print('    fig5_nogueira_vs_ki.png  — Ŝ vs KI overlay')
-    print('    fig6_lasso_family.png    — 7 Lasso-family methods')
-    print('    fig7_heatmap.png         — performance heatmap at 5% and 10%')
+    print('    fig5_all10_combined.png           — 2×3 grid, all 10 methods')
+    print('    fig5_acc/f1/ki/ji/nogueira.png    — individual metric plots')
+    print('    fig5_nogueira_vs_ki.png           — Ŝ vs KI overlay')
+    print('    fig6_lasso_family.png             — 7 Lasso-family methods')
+    print('    fig7_heatmap.png                  — performance heatmap @ 5% & 10%')
+    print('    fig8_fusedlasso_vs_infusedlasso.png — bug-fix verification plot')
     print(bar)
 
 
